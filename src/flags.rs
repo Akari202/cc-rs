@@ -140,7 +140,6 @@ impl<'this> RustcCodegenFlags<'this> {
             // https://doc.rust-lang.org/rustc/codegen-options/index.html#control-flow-guard
             "-Ccontrol-flow-guard" => self.control_flow_guard = value.or(Some("true")),
             // https://doc.rust-lang.org/rustc/codegen-options/index.html#lto
-            //
             // This variable is currently unused, we just keep it in case we need it in future
             "-Clto" => self.lto = value.or(Some("true")),
             // https://doc.rust-lang.org/rustc/linker-plugin-lto.html

@@ -154,6 +154,9 @@ impl Tool {
             let gcc = stdout.contains(r#""gcc""#);
             let emscripten = stdout.contains(r#""emscripten""#);
             let vxworks = stdout.contains(r#""VxWorks""#);
+            let flang = stdout.contains(r#""Flang detected""#);
+            let gfortran = stdout.contains(r#""GNU Fortran Compiler detected""#);
+            let ifx = stdout.contains(r#""Intel Fortran Compiler (ifx) detected""#);
 
             match (clang, accepts_cl_style_flags, gcc, emscripten, vxworks) {
                 (clang_cl, true, _, false, false) => Ok(ToolFamily::Msvc { clang_cl }),
@@ -161,13 +164,29 @@ impl Tool {
                     zig_cc: is_zig_cc(path, cargo_output),
                 }),
                 (false, false, true, _, false) | (_, _, _, _, true) => Ok(ToolFamily::Gnu),
-                (false, false, false, false, false) => {
-                    cargo_output.print_warning(&"Compiler family detection failed since it does not define `__clang__`, `__GNUC__`, `__EMSCRIPTEN__` or `__VXWORKS__`, also does not accept cl style flag `-?`, fallback to treating it as GNU");
-                    Err(Error::new(
+                (false, false, false, false, false) => {}
+            }
+
+            if accepts_cl_style_flags && !emscripten && !vxworks {
+                Ok(ToolFamily::Msvc { clang })
+            } else if (clang && !vxworks) || (emscripten && !vxworks) {
+                Ok(ToolFamily::Clang {
+                    zig_cc: is_zig_cc(path, cargo_output),
+                })
+            } else if (!clang && !accepts_cl_style_flags && gcc && !vxworks) || vxworks {
+                Ok(ToolFamily::Gnu)
+            } else if flang {
+                Ok(ToolFamily::Flang)
+            } else if gfortran {
+                Ok(ToolFamily::GFortran)
+            } else if ifx {
+                Ok(ToolFamily::IntelIFX)
+            } else {
+                cargo_output.print_warning(&"Compiler family detection failed since it does not define `__clang__`, `__GNUC__` or `__EMSCRIPTEN__`, `__VXWORKS__`, `__flang__`, `__GFORTRAN__`, `__INTEL_COMPILER`, also does not accept cl style flag `-?`, fallback to treating it as GNU");
+                Err(Error::new(
                         ErrorKind::ToolFamilyMacroNotFound,
-                        "Expects macro `__clang__`, `__GNUC__` or `__EMSCRIPTEN__`, `__VXWORKS__` or accepts cl style flag `-?`, but found none",
+                        "Expects macro `__clang__`, `__GNUC__` or `__EMSCRIPTEN__`, `__VXWORKS__` , `__flang__`, `__GFORTRAN__`, `__INTEL_COMPILER` or accepts cl style flag `-?`, but found none",
                     ))
-                }
             }
         }
 
@@ -189,7 +208,7 @@ impl Tool {
                     .into(),
             })?;
 
-            let mut tmp =
+            let mut tmp_c =
                 NamedTempfile::new(&out_dir, "detect_compiler_family.c").map_err(|err| Error {
                     kind: ErrorKind::IOError,
                     message: format!(
@@ -199,12 +218,31 @@ impl Tool {
                     )
                     .into(),
                 })?;
-            let mut tmp_file = tmp.take_file().unwrap();
-            tmp_file.write_all(include_bytes!("detect_compiler_family.c"))?;
+            let mut tmp_c_file = tmp_c.take_file().unwrap();
+            tmp_c_file.write_all(include_bytes!("detect_compiler_family.c"))?;
             // Close the file handle *now*, otherwise the compiler may fail to open it on Windows
             // (#1082). The file stays on disk and its path remains valid until `tmp` is dropped.
-            tmp_file.flush()?;
-            tmp_file.sync_data()?;
+            tmp_c_file.flush()?;
+            tmp_c_file.sync_data()?;
+            drop(tmp_file);
+            let mut tmp_f90 =
+                NamedTempfile::new(&out_dir, "detect_compiler_family.f90").map_err(|err| {
+                    Error {
+                        kind: ErrorKind::IOError,
+                        message: format!(
+                            "failed to create detect_compiler_family.f90 temp file in '{}': {}",
+                            out_dir.display(),
+                            err
+                        )
+                        .into(),
+                    }
+                })?;
+            let mut tmp_f90_file = tmp_f90.take_file().unwrap();
+            tmp_f90_file.write_all(include_bytes!("detect_compiler_family.f90"))?;
+            // Close the file handle *now*, otherwise the compiler may fail to open it on Windows
+            // (#1082). The file stays on disk and its path remains valid until `tmp` is dropped.
+            tmp_f90_file.flush()?;
+            tmp_f90_file.sync_data()?;
             drop(tmp_file);
 
             // When expanding the file, the compiler prints a lot of information to stderr
@@ -294,6 +332,7 @@ impl Tool {
                 }
                 Some(fname) if fname.contains("zig") => ToolFamily::Clang { zig_cc: true },
                 _ => ToolFamily::Gnu,
+                _ => ToolFamily::GFortran,
             }
         });
 
@@ -337,12 +376,21 @@ impl Tool {
         let flag = flag.to_str().unwrap();
         let mut chars = flag.chars();
 
+        // fortran note:
+        // TODO: something similar to is_like_msvc may be needed
+        // intel ifx/ifort on windows require / rather than - for compiler flags
+
         // Only duplicate check compiler flags
         if self.is_like_msvc() {
             if chars.next() != Some('/') {
                 return false;
             }
-        } else if (self.is_like_gnu() || self.is_like_clang()) && chars.next() != Some('-') {
+        } else if (self.is_like_gnu()
+            || self.is_like_clang()
+            || self.is_like_gnu_fortran()
+            || self.is_like_flang())
+            && chars.next() != Some('-')
+        {
             return false;
         }
 
@@ -414,6 +462,7 @@ impl Tool {
         &self.env
     }
 
+    // NOTE: fortran just returned empty
     /// Returns the compiler command in format of CC environment variable.
     /// Or empty string if CC env was not present
     ///
@@ -458,6 +507,17 @@ impl Tool {
         matches!(self.family, ToolFamily::Clang { .. })
     }
 
+    // TODO: Im not sure if both are necessary to have separate from the cc tools, find out in
+    // testing
+    pub fn is_like_gnu_fortran(&self) -> bool {
+        self.family == ToolFamily::GFortran
+    }
+
+    /// Whether the tool is Flang-like.
+    pub fn is_like_flang(&self) -> bool {
+        matches!(self.family, ToolFamily::Flang { .. })
+    }
+
     /// Whether the tool is AppleClang under .xctoolchain
     #[cfg(target_vendor = "apple")]
     pub(crate) fn is_xctoolchain_clang(&self) -> bool {
@@ -497,9 +557,19 @@ pub enum ToolFamily {
     Gnu,
     /// Tool is Clang-like. It differs from the GCC in a sense that it accepts superset of flags
     /// and its cross-compilation approach is different.
-    Clang { zig_cc: bool },
+    Clang {
+        zig_cc: bool,
+    },
     /// Tool is the MSVC cl.exe.
-    Msvc { clang_cl: bool },
+    Msvc {
+        clang_cl: bool,
+    },
+    /// Tool is GNU Fortran Compiler-like
+    GFortran,
+    /// Tool is Intel IFX Fortran Compiler-like
+    IntelIFX,
+    Flang,
+    LFortran,
 }
 
 impl ToolFamily {
@@ -582,7 +652,8 @@ impl ToolFamily {
         }
     }
 
+    // TODO: flang?
     pub(crate) fn verbose_stderr(&self) -> bool {
-        matches!(*self, ToolFamily::Clang { .. })
+        matches!(*self, ToolFamily::Clang { .. }) || matches!(*self, ToolFamily::Flang { .. })
     }
 }

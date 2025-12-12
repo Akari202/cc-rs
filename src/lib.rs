@@ -1,5 +1,5 @@
 //! A library for [Cargo build scripts](https://doc.rust-lang.org/cargo/reference/build-scripts.html)
-//! to compile a set of C/C++/assembly/CUDA files into a static archive for Cargo
+//! to compile a set of C/C++/assembly/CUDA/Fortran files into a static archive for Cargo
 //! to link into the crate being built. This crate does not compile code itself;
 //! it calls out to the default compiler for the platform. This crate will
 //! automatically detect situations such as cross compilation and
@@ -397,6 +397,7 @@ pub struct Build {
     cuda: bool,
     cudart: Option<Arc<str>>,
     ccbin: bool,
+    fortrancbin: bool,
     std: Option<Arc<str>>,
     target: Option<Arc<str>>,
     /// The host compiler.
@@ -531,6 +532,7 @@ impl Build {
             cuda: false,
             cudart: None,
             ccbin: true,
+            fortrancbin: true,
             std: None,
             target: None,
             host: None,
@@ -917,7 +919,7 @@ impl Build {
         self
     }
 
-    /// Specify the C or C++ language standard version.
+    /// Specify the C, C++, or Fortran language standard version.
     ///
     /// These values are common to modern versions of GCC, Clang and MSVC:
     /// - `c11` for ISO/IEC 9899:2011
@@ -1432,17 +1434,591 @@ impl Build {
             out_dir.join("flag_check.cu")
         } else if self.cpp {
             out_dir.join("flag_check.cpp")
+        } else if self.fortrancbin {
+            out_dir.join("flag_check.f90")
         } else {
             out_dir.join("flag_check.c")
         };
 
         if !src.exists() {
-            let mut f = fs::File::create(&src)?;
-            write!(f, "int main(void) {{ return 0; }}")?;
-        }
+            if self.fortrancbin {
+                let mut f = fs::File::create(&src)?;
 
+                write!(
+                    f,
+                    r#"
+          program main
+          print *, 'hello flag_check.f90'
+          end program
+          "#
+                )?;
+            } else{
+                let mut f = fs::File::create(&src)?;
+                write!(f, "int main(void) {{ return 0; }}")?;
+            }
+        }
         Ok(src)
     }
+<<<HEAD
+===
+
+    /// Get a single-valued environment variable with target variants.
+    fn getenv_with_target_prefixes(&self, env: &str) -> Result<Arc<OsStr>, Error> {
+        // Take from first environment variable in the environment.
+        let res = self
+            .target_envs(env)?
+            .iter()
+            .filter_map(|env| self.getenv(env))
+            .next();
+
+        match res {
+            Some(res) => Ok(res),
+            None => Err(Error::new(
+                ErrorKind::EnvVarNotFound,
+                format!("could not find environment variable {env}"),
+            )),
+        }
+    }
+
+    /// Returns a fallback `fortranc_compiler_wrapper` by introspecting `RUSTC_WRAPPER`
+    fn rustc_wrapper_fallback(&self) -> Option<Arc<OsStr>> {
+        // No explicit CC wrapper was detected, but check if RUSTC_WRAPPER
+        // is defined and is a build accelerator that is compatible with
+        // C/C++ compilers (e.g. sccache)
+        const VALID_WRAPPERS: &[&str] = &["sccache", "cachepot", "buildcache"];
+
+        let rustc_wrapper = self.getenv("RUSTC_WRAPPER")?;
+        let wrapper_path = Path::new(&rustc_wrapper);
+        let wrapper_stem = wrapper_path.file_stem()?;
+
+        if VALID_WRAPPERS.contains(&wrapper_stem.to_str()?) {
+            Some(rustc_wrapper)
+        } else {
+            None
+        }
+    }
+
+    /// Returns compiler path, optional modifier name from whitelist, and arguments vec
+    fn env_tool(&self, name: &str) -> Option<(PathBuf, Option<Arc<OsStr>>, Vec<String>)> {
+        let tool = self.getenv_with_target_prefixes(name).ok()?;
+        let tool = tool.to_string_lossy();
+        let tool = tool.trim();
+
+        if tool.is_empty() {
+            return None;
+        }
+
+        // If this is an exact path on the filesystem we don't want to do any
+        // interpretation at all, just pass it on through. This'll hopefully get
+        // us to support spaces-in-paths.
+        if Path::new(tool).exists() {
+            return Some((
+                PathBuf::from(tool),
+                self.rustc_wrapper_fallback(),
+                Vec::new(),
+            ));
+        }
+
+        // Ok now we want to handle a couple of scenarios. We'll assume from
+        // here on out that spaces are splitting separate arguments. Two major
+        // features we want to support are:
+        //
+        //      CC='sccache cc'
+        //
+        // aka using `sccache` or any other wrapper/caching-like-thing for
+        // compilations. We want to know what the actual compiler is still,
+        // though, because our `Tool` API support introspection of it to see
+        // what compiler is in use.
+        //
+        // additionally we want to support
+        //
+        //      CC='cc -flag'
+        //
+        // where the CC env var is used to also pass default flags to the C
+        // compiler.
+        //
+        // It's true that everything here is a bit of a pain, but apparently if
+        // you're not literally make or bash then you get a lot of bug reports.
+        let mut known_wrappers = vec![
+            "ccache",
+            "distcc",
+            "sccache",
+            "icecc",
+            "cachepot",
+            "buildcache",
+        ];
+        let custom_wrapper = self.getenv("FORTRANC_KNOWN_WRAPPER_CUSTOM");
+        if custom_wrapper.is_some() {
+            known_wrappers.push(custom_wrapper.as_deref().unwrap().to_str().unwrap());
+        }
+
+        let mut parts = tool.split_whitespace();
+        let maybe_wrapper = parts.next()?;
+
+        let file_stem = Path::new(maybe_wrapper).file_stem()?.to_str()?;
+        if known_wrappers.contains(&file_stem) {
+            if let Some(compiler) = parts.next() {
+                return Some((
+                    compiler.into(),
+                    Some(Arc::<OsStr>::from(OsStr::new(&maybe_wrapper))),
+                    parts.map(|s| s.to_string()).collect(),
+                ));
+            }
+        }
+
+        Some((
+            maybe_wrapper.into(),
+            self.rustc_wrapper_fallback(),
+            parts.map(|s| s.to_string()).collect(),
+        ))
+    }
+    fn get_target(&self) -> Result<TargetInfo<'_>, Error> {
+        match &self.target {
+            Some(t) if Some(&**t) != self.getenv_unwrap_str("TARGET").ok().as_deref() => t.parse(),
+            // Fetch target information from environment if not set, or if the
+            // target was the same as the TARGET environment variable, in
+            // case the user did `build.target(&env::var("TARGET").unwrap())`.
+            _ => self
+                .build_cache
+                .target_info_parser
+                .parse_from_cargo_environment_variables(),
+        }
+    }
+
+    fn get_raw_target(&self) -> Result<Cow<'_, str>, Error> {
+        match &self.target {
+            Some(t) => Ok(Cow::Borrowed(t)),
+            None => self.getenv_unwrap_str("TARGET").map(Cow::Owned),
+        }
+    }
+
+    fn get_is_cross_compile(&self) -> Result<bool, Error> {
+        let target = self.get_raw_target()?;
+        let host: Cow<'_, str> = match &self.host {
+            Some(h) => Cow::Borrowed(h),
+            None => Cow::Owned(self.getenv_unwrap_str("HOST")?),
+        };
+        Ok(host != target)
+    }
+
+    fn cmd<P: AsRef<OsStr>>(&self, prog: P) -> Command {
+        let mut cmd = Command::new(prog);
+        for (a, b) in self.env.iter() {
+            cmd.env(a, b);
+        }
+        cmd
+    }
+
+    fn get_base_compiler(&self) -> Result<Tool, Error> {
+        let out_dir = self.get_out_dir().ok();
+        let out_dir = out_dir.as_deref();
+
+        if let Some(c) = &self.compiler {
+            return Ok(Tool::new(
+                (**c).to_owned(),
+                &self.build_cache.cached_compiler_family,
+                &self.cargo_output,
+                out_dir,
+            ));
+        }
+        let target = self.get_target()?;
+
+        /*
+
+                let raw_target = self.get_raw_target()?;
+                let (env, msvc, gnu, traditional, clang) = if self.cpp {
+                    ("CXX", "cl.exe", "g++", "c++", "clang++")
+                } else {
+                    ("CC", "cl.exe", "gcc", "cc", "clang")
+                };
+
+                // On historical Solaris systems, "cc" may have been Sun Studio, which
+                // is not flag-compatible with "gcc".  This history casts a long shadow,
+                // and many modern illumos distributions today ship GCC as "gcc" without
+                // also making it available as "cc".
+                let default = if cfg!(target_os = "solaris") || cfg!(target_os = "illumos") {
+                    gnu
+                } else {
+                    traditional
+                };
+
+
+        */
+        let cl_exe = self.windows_registry_find_tool(&target, "cl.exe");
+
+        let env = "FC";
+        let msvc = "cl.exe";
+        let gfortran = "gfortran";
+        let flang = "flang";
+        let default = gfortran;
+
+        let tool_opt: Option<Tool> = self
+            .env_tool(env)
+            .map(|(tool, _wrapper, args)| {
+                // Chop off leading/trailing whitespace to work around
+                // semi-buggy build scripts which are shared in
+                // makefiles/configure scripts (where spaces are far more
+                // lenient)
+                let t = Tool::with_args(
+                    tool,
+                    args.clone(),
+                    &self.build_cache.cached_compiler_family,
+                    &self.cargo_output,
+                    out_dir,
+                );
+                /*
+                if let Some(cc_wrapper) = wrapper {
+                    t.cc_wrapper_path = Some(Path::new(&cc_wrapper).to_owned());
+                }
+                for arg in args {
+                    t.cc_wrapper_args.push(arg.into());
+                }*/
+                t
+            })
+            .or_else(|| {
+                /*
+                if target.os == "emscripten" {
+                    let tool = if self.cpp { "em++" } else { "emcc" };
+                    // Windows uses bat file so we have to be a bit more specific
+                    if cfg!(windows) {
+                        let mut t = Tool::with_family(
+                            PathBuf::from("cmd"),
+                            ToolFamily::Clang { zig_cc: false },
+                        );
+                        t.args.push("/c".into());
+                        t.args.push(format!("{}.bat", tool).into());
+                        Some(t)
+                    } else {
+                        Some(Tool::new(
+                            PathBuf::from(tool),
+                            &self.build_cache.cached_compiler_family,
+                            &self.cargo_output,
+                            out_dir,
+                        ))
+                    }
+                } else {
+                    None
+                }*/
+                None
+            })
+            .or_else(|| cl_exe.clone());
+
+        let tool = match tool_opt {
+            Some(t) => t,
+            None => {
+                let compiler = if cfg!(windows) && target.os == "windows" {
+                    if target.env == "msvc" {
+                        msvc.to_string()
+                    } else {
+                        let cc = if target.abi == "llvm" {
+                            flang
+                        } else {
+                            gfortran
+                        };
+                        format!("{}.exe", cc)
+                    }
+                } else if target.os == "ios"
+                    || target.os == "watchos"
+                    || target.os == "tvos"
+                    || target.os == "visionos"
+                {
+                    flang.to_string()
+                }
+                /*else if target.os == "android" {
+                    autodetect_android_compiler(&raw_target, gnu, clang)
+                } else if target.os == "cloudabi" {
+                    format!(
+                        "{}-{}-{}-{}",
+                        target.full_arch, target.vendor, target.os, traditional
+                    )
+                } else if target.arch == "wasm32" || target.arch == "wasm64" {
+                    // Compiling WASM is not currently supported by GCC, so
+                    // let's default to Clang.
+                    clang.to_string()
+                } else if target.os == "vxworks" {
+                    if self.cpp {
+                        "wr-c++".to_string()
+                    } else {
+                        "wr-cc".to_string()
+                    }
+                } else if target.arch == "arm" && target.vendor == "kmc" {
+                    format!("arm-kmc-eabi-{}", gnu)
+                } else if target.arch == "aarch64" && target.vendor == "kmc" {
+                    format!("aarch64-kmc-elf-{}", gnu)
+                } else if target.os == "nto" {
+                    // See for details: https://github.com/rust-lang/cc-rs/pull/1319
+                    if self.cpp {
+                        "q++".to_string()
+                    } else {
+                        "qcc".to_string()
+                    }
+                } else if self.get_is_cross_compile()? {
+                    let prefix = self.prefix_for_target(&raw_target);
+                    match prefix {
+                        Some(prefix) => {
+                            let cc = if target.abi == "llvm" { clang } else { gnu };
+                            format!("{}-{}", prefix, cc)
+                        }
+                        None => default.to_string(),
+                    }
+                } */
+                else {
+                    default.to_string()
+                };
+
+                let t = Tool::new(
+                    PathBuf::from(compiler),
+                    &self.build_cache.cached_compiler_family,
+                    &self.cargo_output,
+                    out_dir,
+                );
+                /*
+                if let Some(cc_wrapper) = self.rustc_wrapper_fallback() {
+                    t.cc_wrapper_path = Some(Path::new(&cc_wrapper).to_owned());
+                }*/
+                t
+            }
+        };
+        /*
+                let mut tool = if self.cuda {
+                    assert!(
+                        tool.args.is_empty(),
+                        "CUDA compilation currently assumes empty pre-existing args"
+                    );
+                    let nvcc = match self.getenv_with_target_prefixes("NVCC") {
+                        Err(_) => PathBuf::from("nvcc"),
+                        Ok(nvcc) => PathBuf::from(&*nvcc),
+                    };
+                    let mut nvcc_tool = Tool::with_features(
+                        nvcc,
+                        vec![],
+                        self.cuda,
+                        &self.build_cache.cached_compiler_family,
+                        &self.cargo_output,
+                        out_dir,
+                    );
+                    if self.ccbin {
+                        nvcc_tool
+                          .args
+                          .push(format!("-ccbin={}", tool.path.display()).into());
+                    }
+                    if let Some(cc_wrapper) = self.rustc_wrapper_fallback() {
+                        nvcc_tool.cc_wrapper_path = Some(Path::new(&cc_wrapper).to_owned());
+                    }
+                    nvcc_tool.family = tool.family;
+                    nvcc_tool
+                } else {
+                    tool
+                };
+        *//*
+                // New "standalone" C/C++ cross-compiler executables from recent Android NDK
+                // are just shell scripts that call main clang binary (from Android NDK) with
+                // proper `--target` argument.
+                //
+                // For example, armv7a-linux-androideabi16-clang passes
+                // `--target=armv7a-linux-androideabi16` to clang.
+                //
+                // As the shell script calls the main clang binary, the command line limit length
+                // on Windows is restricted to around 8k characters instead of around 32k characters.
+                // To remove this limit, we call the main clang binary directly and construct the
+                // `--target=` ourselves.
+                if cfg!(windows) && android_clang_compiler_uses_target_arg_internally(&tool.path) {
+                    if let Some(path) = tool.path.file_name() {
+                        let file_name = path.to_str().unwrap().to_owned();
+                        let (target, clang) = file_name.split_at(file_name.rfind('-').unwrap());
+
+                        tool.has_internal_target_arg = true;
+                        tool.path.set_file_name(clang.trim_start_matches('-'));
+                        tool.path.set_extension("exe");
+                        tool.args.push(format!("--target={}", target).into());
+
+                        // Additionally, shell scripts for target i686-linux-android versions 16 to 24
+                        // pass the `mstackrealign` option so we do that here as well.
+                        if target.contains("i686-linux-android") {
+                            let (_, version) = target.split_at(target.rfind('d').unwrap() + 1);
+                            if let Ok(version) = version.parse::<u32>() {
+                                if version > 15 && version < 25 {
+                                    tool.args.push("-mstackrealign".into());
+                                }
+                            }
+                        }
+                    };
+                }
+        */
+        /*
+                // If we found `cl.exe` in our environment, the tool we're returning is
+                // an MSVC-like tool, *and* no env vars were set then set env vars for
+                // the tool that we're returning.
+                //
+                // Env vars are needed for things like `link.exe` being put into PATH as
+                // well as header include paths sometimes. These paths are automatically
+                // included by default but if the `CC` or `CXX` env vars are set these
+                // won't be used. This'll ensure that when the env vars are used to
+                // configure for invocations like `clang-cl` we still get a "works out
+                // of the box" experience.
+                if let Some(cl_exe) = cl_exe {
+                    if tool.family == (ToolFamily::Msvc { clang_cl: true })
+                      && tool.env.is_empty()
+                      && target.env == "msvc"
+                    {
+                        for (k, v) in cl_exe.env.iter() {
+                            tool.env.push((k.to_owned(), v.to_owned()));
+                        }
+                    }
+                }
+
+                if target.env == "msvc" && tool.family == ToolFamily::Gnu {
+                    self.cargo_output
+                      .print_warning(&"GNU compiler is not supported for this target");
+                }
+        */
+        Ok(tool)
+    }
+
+    fn get_shell_escaped_flags(&self) -> bool {
+        self.shell_escaped_flags
+            .unwrap_or_else(|| self.getenv_boolean("FORTRANC_SHELL_ESCAPED_FLAGS"))
+    }
+
+    fn get_out_dir(&self) -> Result<Cow<'_, Path>, Error> {
+        match &self.out_dir {
+            Some(p) => Ok(Cow::Borrowed(&**p)),
+            None => self
+                .getenv("OUT_DIR")
+                .as_deref()
+                .map(PathBuf::from)
+                .map(Cow::Owned)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::EnvVarNotFound,
+                        "Environment variable OUT_DIR not defined.",
+                    )
+                }),
+        }
+    }
+
+    #[allow(clippy::disallowed_methods)]
+    fn getenv(&self, v: &str) -> Option<Arc<OsStr>> {
+        // Returns true for environment variables cargo sets for build scripts:
+        // https://doc.rust-lang.org/cargo/reference/environment-variables.html#environment-variables-cargo-sets-for-build-scripts
+        //
+        // This handles more of the vars than we actually use (it tries to check
+        // complete-ish set), just to avoid needing maintenance if/when new
+        // calls to `getenv`/`getenv_unwrap` are added.
+        fn provided_by_cargo(envvar: &str) -> bool {
+            match envvar {
+                v if v.starts_with("CARGO") || v.starts_with("RUSTC") => true,
+                "HOST" | "TARGET" | "RUSTDOC" | "OUT_DIR" | "OPT_LEVEL" | "DEBUG" | "PROFILE"
+                | "NUM_JOBS" | "RUSTFLAGS" => true,
+                _ => false,
+            }
+        }
+        if let Some(val) = self.build_cache.env_cache.read().unwrap().get(v).cloned() {
+            return val;
+        }
+        // Excluding `PATH` prevents spurious rebuilds on Windows, see
+        // <https://github.com/rust-lang/cc-rs/pull/1215> for details.
+        if self.emit_rerun_if_env_changed && !provided_by_cargo(v) && v != "PATH" {
+            self.cargo_output
+                .print_metadata(&format_args!("cargo:rerun-if-env-changed={}", v));
+        }
+        let r = env::var_os(v).map(Arc::from);
+        self.cargo_output.print_metadata(&format_args!(
+            "{} = {}",
+            v,
+            OptionOsStrDisplay(r.as_deref())
+        ));
+        self.build_cache
+            .env_cache
+            .write()
+            .unwrap()
+            .insert(v.into(), r.clone());
+        r
+    }
+
+    /// get boolean flag that is either true or false
+    fn getenv_boolean(&self, v: &str) -> bool {
+        match self.getenv(v) {
+            Some(s) => &*s != "0" && &*s != "false" && !s.is_empty(),
+            None => false,
+        }
+    }
+
+    fn getenv_unwrap(&self, v: &str) -> Result<Arc<OsStr>, Error> {
+        match self.getenv(v) {
+            Some(s) => Ok(s),
+            None => Err(Error::new(
+                ErrorKind::EnvVarNotFound,
+                format!("Environment variable {} not defined.", v),
+            )),
+        }
+    }
+    fn getenv_unwrap_str(&self, v: &str) -> Result<String, Error> {
+        let env = self.getenv_unwrap(v)?;
+        env.to_str().map(String::from).ok_or_else(|| {
+            Error::new(
+                ErrorKind::EnvVarNotFound,
+                format!("Environment variable {} is not valid utf-8.", v),
+            )
+        })
+    }
+
+    /// The list of environment variables to check for a given env, in order of priority.
+    fn target_envs(&self, env: &str) -> Result<[String; 4], Error> {
+        let target = self.get_raw_target()?;
+        let kind = if self.get_is_cross_compile()? {
+            "TARGET"
+        } else {
+            "HOST"
+        };
+        let target_u = target.replace('-', "_");
+
+        Ok([
+            format!("{env}_{target}"),
+            format!("{env}_{target_u}"),
+            format!("{kind}_{env}"),
+            env.to_string(),
+        ])
+    }
+
+    /// Get values from CFLAGS-style environment variable.
+    fn envflags(&self, env: &str) -> Result<Option<Vec<String>>, Error> {
+        // Collect from all environment variables, in reverse order as in
+        // `getenv_with_target_prefixes` precedence (so that `CFLAGS_$TARGET`
+        // can override flags in `TARGET_CFLAGS`, which overrides those in
+        // `CFLAGS`).
+        let mut any_set = false;
+        let mut res = vec![];
+        for env in self.target_envs(env)?.iter().rev() {
+            if let Some(var) = self.getenv(env) {
+                any_set = true;
+
+                let var = var.to_string_lossy();
+                if self.get_shell_escaped_flags() {
+                    res.extend(Shlex::new(&var));
+                } else {
+                    res.extend(var.split_ascii_whitespace().map(ToString::to_string));
+                }
+            }
+        }
+
+        Ok(if any_set { Some(res) } else { None })
+    }
+
+    /*
+    fn get_target(&self) -> Result<TargetInfo<'_>, Error> {
+        match &self.target {
+            Some(t) if Some(&**t) != self.getenv_unwrap_str("TARGET").ok().as_deref() => t.parse(),
+            // Fetch target information from environment if not set, or if the
+            // target was the same as the TARGET environment variable, in
+            // case the user did `build.target(&env::var("TARGET").unwrap())`.
+            _ => self
+              .build_cache
+              .target_info_parser
+              .parse_from_cargo_environment_variables(),
+        }
+    }*/
+>>>fortranc-rs/main
 
     fn is_flag_supported_inner(
         &self,
@@ -1502,6 +2078,8 @@ impl Build {
         }
 
         let mut cmd = compiler.to_command();
+        let ifx = compiler.family == ToolFamily::IntelIFX;
+        let lfortran = compiler.family == ToolFamily::LFortran;
         command_add_output_file(
             &mut cmd,
             &obj,
@@ -1511,6 +2089,10 @@ impl Build {
                 msvc: compiler.is_like_msvc(),
                 clang: compiler.is_like_clang(),
                 gnu: compiler.is_like_gnu(),
+                flang: compiler.is_like_flang(),
+                gfortran: compiler.is_like_gnu_fortran(),
+                ifx,
+                lfortran,
                 is_asm: false,
                 is_arm: is_arm(target),
             },
@@ -1540,6 +2122,12 @@ impl Build {
         }
 
         let output = cmd.current_dir(out_dir).output()?;
+        if ifx {
+            // set -nologo for Intel compiler, otherwise it will print on stderr something akin to:
+            // Intel(R) Fortran Compiler for applications running on Intel(R) 64, Version 2025.0.4 Build 20241205
+            // Copyright (C) 1985-2024 Intel Corporation. All rights reserved.
+            cmd.arg("-nologo");
+        }
         let is_supported = output.status.success() && output.stderr.is_empty();
 
         self.build_cache
@@ -1551,6 +2139,7 @@ impl Build {
         Ok(is_supported)
     }
 
+<<<HEAD
     /// Run the compiler, generating the file `output`
     ///
     /// This will return a result instead of panicking; see [`Self::compile()`] for
@@ -1933,6 +2522,7 @@ impl Build {
         }
     }
 
+<<<HEAD
     /// Get the compiler that's in use for this configuration.
     ///
     /// This will return a result instead of panicking; see
@@ -2042,6 +2632,109 @@ impl Build {
 
         Ok(cmd)
     }
+===
+
+    /// Get the compiler that's in use for this configuration.
+    ///
+    /// This will return a result instead of panicking; see
+    /// [`get_compiler()`](Self::get_compiler) for the complete description.
+    pub fn try_get_compiler(&self) -> Result<Tool, Error> {
+        let opt_level = self.get_opt_level()?;
+        let target = self.get_target()?;
+
+        let mut cmd = self.get_base_compiler()?;
+
+        // Disable default flag generation via `no_default_flags` or environment variable
+        let no_defaults = self.no_default_flags || self.getenv_boolean("CRATE_CC_NO_DEFAULTS");
+
+        if !no_defaults {
+            self.add_default_flags(&mut cmd, &target, &opt_level)?;
+        }
+
+        if let Some(ref std) = self.std {
+            let separator = match cmd.family {
+                //ToolFamily::Msvc { .. } => ':',
+                ToolFamily::GFortran | ToolFamily::Flang { .. } => '=',
+                _ => '=',
+            };
+            cmd.push_cc_arg(format!("-std{}{}", separator, std).into());
+        }
+
+        for directory in self.include_directories.iter() {
+            cmd.args.push("-I".into());
+            cmd.args.push(directory.as_os_str().into());
+        }
+        /*
+        let flags = self.envflags(if self.cpp { "CXXFLAGS" } else { "CFLAGS" })?;
+        if let Some(flags) = &flags {
+            for arg in flags {
+                cmd.push_cc_arg(arg.into());
+            }
+        }*/
+        /*
+                // If warnings and/or extra_warnings haven't been explicitly set,
+                // then we set them only if the environment doesn't already have
+                // CFLAGS/CXXFLAGS, since those variables presumably already contain
+                // the desired set of warnings flags.
+
+                if self.warnings.unwrap_or(flags.is_none()) {
+                    let wflags = cmd.family.warnings_flags().into();
+                    cmd.push_cc_arg(wflags);
+                }
+
+                if self.extra_warnings.unwrap_or(flags.is_none()) {
+                    if let Some(wflags) = cmd.family.extra_warnings_flags() {
+                        cmd.push_cc_arg(wflags.into());
+                    }
+                }
+        */
+        for flag in self.flags.iter() {
+            cmd.args.push((**flag).into());
+        }
+
+        // Add cc flags inherited from matching rustc flags
+        if self.inherit_rustflags {
+            self.add_inherited_rustflags(&mut cmd, &target)?;
+        }
+
+        for flag in self.flags_supported.iter() {
+            if self
+                .is_flag_supported_inner(flag, &cmd, &target)
+                .unwrap_or(false)
+            {
+                cmd.push_cc_arg((**flag).into());
+            }
+        }
+
+        for (key, value) in self.definitions.iter() {
+            if let Some(ref value) = *value {
+                cmd.args.push(format!("-D{}={}", key, value).into());
+            } else {
+                cmd.args.push(format!("-D{}", key).into());
+            }
+        }
+        /*
+                if self.warnings_into_errors {
+                    let warnings_to_errors_flag = cmd.family.warnings_to_errors_flag().into();
+                    cmd.push_cc_arg(warnings_to_errors_flag);
+                }
+        *//*
+                // Copied from <https://github.com/rust-lang/rust/blob/5db81020006d2920fc9c62ffc0f4322f90bffa04/compiler/rustc_codegen_ssa/src/back/linker.rs#L27-L38>
+                //
+                // Disables non-English messages from localized linkers.
+                // Such messages may cause issues with text encoding on Windows
+                // and prevent inspection of msvc output in case of errors, which we occasionally do.
+                // This should be acceptable because other messages from rustc are in English anyway,
+                // and may also be desirable to improve searchability of the compiler diagnostics.
+                if matches!(cmd.family, ToolFamily::Msvc { clang_cl: false }) {
+                    cmd.env.push(("VSLANG".into(), "1033".into()));
+                } else {
+                    cmd.env.push(("LC_ALL".into(), "C".into()));
+                }*/
+
+        Ok(cmd)
+    }
+>>>fortranc-rs/main
 
     fn add_default_flags(
         &self,
@@ -2253,6 +2946,7 @@ impl Build {
                         );
                         cmd.push_cc_arg("-pthread".into());
                     }
+
                     // Pass `--target` with the LLVM target to configure Clang for cross-compiling.
                     //
                     // This is **required** for cross-compilation, as it's the only flag that
@@ -2571,6 +3265,153 @@ impl Build {
         Ok(())
     }
 
+<<<HEAD
+
+===
+    /// Run the compiler, generating the file `output`
+    ///
+    /// This will return a result instead of panicking; see [`Self::compile()`] for
+    /// the complete description.
+    pub fn try_compile(&self, output: &str) -> Result<(), Error> {
+        let mut output_components = Path::new(output).components();
+        match (output_components.next(), output_components.next()) {
+            (Some(Component::Normal(_)), None) => {}
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidArgument,
+                    "argument of `compile` must be a single normal path component",
+                ));
+            }
+        }
+
+        let (lib_name, gnu_lib_name) = if output.starts_with("lib") && output.ends_with(".a") {
+            (&output[3..output.len() - 2], output.to_owned())
+        } else {
+            let mut gnu = String::with_capacity(5 + output.len());
+            gnu.push_str("lib");
+            gnu.push_str(output);
+            gnu.push_str(".a");
+            (output, gnu)
+        };
+        let dst = self.get_out_dir()?;
+
+        let objects = objects_from_files(&self.files, &dst)?;
+
+        self.compile_objects(&objects)?;
+        self.assemble(lib_name, &dst.join(gnu_lib_name), &objects)?;
+
+        let target = self.get_target()?;
+        if target.env == "msvc" {
+            let compiler = self.get_base_compiler()?;
+            let atlmfc_lib = compiler
+                .env()
+                .iter()
+                .find(|&(var, _)| var.as_os_str() == OsStr::new("LIB"))
+                .and_then(|(_, lib_paths)| {
+                    env::split_paths(lib_paths).find(|path| {
+                        let sub = Path::new("atlmfc/lib");
+                        path.ends_with(sub) || path.parent().map_or(false, |p| p.ends_with(sub))
+                    })
+                });
+
+            if let Some(atlmfc_lib) = atlmfc_lib {
+                self.cargo_output.print_metadata(&format_args!(
+                    "cargo:rustc-link-search=native={}",
+                    atlmfc_lib.display()
+                ));
+            }
+        }
+
+        if self.link_lib_modifiers.is_empty() {
+            self.cargo_output
+                .print_metadata(&format_args!("cargo:rustc-link-lib=static={}", lib_name));
+        } else {
+            self.cargo_output.print_metadata(&format_args!(
+                "cargo:rustc-link-lib=static:{}={}",
+                JoinOsStrs {
+                    slice: &self.link_lib_modifiers,
+                    delimiter: ','
+                },
+                lib_name
+            ));
+        }
+        self.cargo_output.print_metadata(&format_args!(
+            "cargo:rustc-link-search=native={}",
+            dst.display()
+        ));
+
+        Ok(())
+    }
+
+    /// Run the compiler, generating the file `output`
+    ///
+    /// # Library name
+    ///
+    /// The `output` string argument determines the file name for the compiled
+    /// library. The Rust compiler will create an assembly named "lib"+output+".a".
+    /// MSVC will create a file named output+".lib".
+    ///
+    /// The choice of `output` is close to arbitrary, but:
+    ///
+    /// - must be nonempty,
+    /// - must not contain a path separator (`/`),
+    /// - must be unique across all `compile` invocations made by the same build
+    ///   script.
+    ///
+    /// If your build script compiles a single source file, the base name of
+    /// that source file would usually be reasonable:
+    ///
+    /// ```no_run
+    /// fortranc::Build::new().file("blobstore.c").compile("blobstore");
+    /// ```
+    ///
+    /// Compiling multiple source files, some people use their crate's name, or
+    /// their crate's name + "-cc".
+    ///
+    /// Otherwise, please use your imagination.
+    ///
+    /// For backwards compatibility, if `output` starts with "lib" *and* ends
+    /// with ".a", a second "lib" prefix and ".a" suffix do not get added on,
+    /// but this usage is deprecated; please omit `lib` and `.a` in the argument
+    /// that you pass.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `output` is not formatted correctly or if one of the underlying
+    /// compiler commands fails. It can also panic if it fails reading file names
+    /// or creating directories.
+    pub fn compile(&self, output: &str) {
+        if let Err(e) = self.try_compile(output) {
+            fail(&e.message);
+        }
+    }
+
+    /// Run the compiler, generating intermediate files, but without linking
+    /// them into an archive file.
+    ///
+    /// This will return a list of compiled object files, in the same order
+    /// as they were passed in as `file`/`files` methods.
+    pub fn compile_intermediates(&self) -> Vec<PathBuf> {
+        match self.try_compile_intermediates() {
+            Ok(v) => v,
+            Err(e) => fail(&e.message),
+        }
+    }
+
+    /// Run the compiler, generating intermediate files, but without linking
+    /// them into an archive file.
+    ///
+    /// This will return a result instead of panicking; see `compile_intermediates()` for the complete description.
+    pub fn try_compile_intermediates(&self) -> Result<Vec<PathBuf>, Error> {
+        let dst = self.get_out_dir()?;
+        let objects = objects_from_files(&self.files, &dst)?;
+
+        self.compile_objects(&objects)?;
+
+        Ok(objects.into_iter().map(|v| v.dst).collect())
+    }
+>>>fortranc-rs/main
+
     fn msvc_macro_assembler(&self) -> Result<Command, Error> {
         let target = self.get_target()?;
         let tool = match target.arch {
@@ -2629,6 +3470,227 @@ impl Build {
 
         Ok(cmd)
     }
+<<<HEAD
+===
+    fn create_compile_object_cmd(&self, obj: &Object) -> Result<Command, Error> {
+        let asm_ext = AsmFileExt::from_path(&obj.src);
+        let is_asm = asm_ext.is_some();
+        let target = self.get_target()?;
+        let msvc = target.env == "msvc";
+        let compiler = self.try_get_compiler()?;
+        let flang = compiler.is_like_flang();
+        let gfortran = compiler.family == ToolFamily::GFortran;
+        let ifx = compiler.family == ToolFamily::IntelIFX;
+        let lfortran = compiler.family == ToolFamily::LFortran;
+
+        let is_assembler_msvc = msvc && asm_ext == Some(AsmFileExt::DotAsm);
+        let mut cmd = if is_assembler_msvc {
+            self.msvc_macro_assembler()?
+        } else {
+            let mut cmd = compiler.to_command();
+            for (a, b) in self.env.iter() {
+                cmd.env(a, b);
+            }
+            cmd
+        };
+        let is_arm = matches!(target.arch, "aarch64" | "arm");
+        command_add_output_file(
+            &mut cmd,
+            &obj.dst,
+            CmdAddOutputFileArgs {
+                cuda: false, //self.cuda,
+                is_assembler_msvc,
+                msvc: false, //compiler.is_like_msvc(),
+                flang,
+                gfortran,
+                ifx,
+                lfortran,
+                is_asm,
+                is_arm,
+            },
+        );
+        // armasm and armasm64 don't require -c option
+        if !is_assembler_msvc || !is_arm {
+            cmd.arg("-c");
+        }
+        /*
+        if self.cuda && self.cuda_file_count() > 1 {
+            cmd.arg("--device-c");
+        }*/
+        if is_asm {
+            cmd.args(self.asm_flags.iter().map(std::ops::Deref::deref));
+        }
+        /*
+        if compiler.supports_path_delimiter() && !is_assembler_msvc {
+            // #513: For `clang-cl`, separate flags/options from the input file.
+            // When cross-compiling macOS -> Windows, this avoids interpreting
+            // common `/Users/...` paths as the `/U` flag and triggering
+            // `-Wslash-u-filename` warning.
+            cmd.arg("--");
+        }*/
+        cmd.arg(&obj.src);
+        /*
+        if cfg!(target_os = "macos") {
+            self.fix_env_for_apple_os(&mut cmd)?;
+        }*/
+
+        Ok(cmd)
+    }
+
+    #[cfg(feature = "parallel")]
+    fn compile_objects(&self, objs: &[Object]) -> Result<(), Error> {
+        use std::cell::Cell;
+
+        use parallel::async_executor::{block_on, YieldOnce};
+
+        check_disabled()?;
+
+        if objs.len() <= 1 {
+            for obj in objs {
+                let mut cmd = self.create_compile_object_cmd(obj)?;
+                run(&mut cmd, &self.cargo_output)?;
+            }
+
+            return Ok(());
+        }
+
+        // Limit our parallelism globally with a jobserver.
+        let mut tokens = parallel::job_token::ActiveJobTokenServer::new();
+
+        // When compiling objects in parallel we do a few dirty tricks to speed
+        // things up:
+        //
+        // * First is that we use the `jobserver` crate to limit the parallelism
+        //   of this build script. The `jobserver` crate will use a jobserver
+        //   configured by Cargo for build scripts to ensure that parallelism is
+        //   coordinated across C compilations and Rust compilations. Before we
+        //   compile anything we make sure to wait until we acquire a token.
+        //
+        //   Note that this jobserver is cached globally so we only used one per
+        //   process and only worry about creating it once.
+        //
+        // * Next we use spawn the process to actually compile objects in
+        //   parallel after we've acquired a token to perform some work
+        //
+        // With all that in mind we compile all objects in a loop here, after we
+        // acquire the appropriate tokens, Once all objects have been compiled
+        // we wait on all the processes and propagate the results of compilation.
+
+        let pendings =
+            Cell::new(Vec::<(Command, KillOnDrop, parallel::job_token::JobToken)>::new());
+        let is_disconnected = Cell::new(false);
+        let has_made_progress = Cell::new(false);
+
+        let wait_future = async {
+            let mut error = None;
+            // Buffer the stdout
+            let mut stdout = io::BufWriter::with_capacity(128, io::stdout());
+
+            loop {
+                // If the other end of the pipe is already disconnected, then we're not gonna get any new jobs,
+                // so it doesn't make sense to reuse the tokens; in fact,
+                // releasing them as soon as possible (once we know that the other end is disconnected) is beneficial.
+                // Imagine that the last file built takes an hour to finish; in this scenario,
+                // by not releasing the tokens before that last file is done we would effectively block other processes from
+                // starting sooner - even though we only need one token for that last file, not N others that were acquired.
+
+                let mut pendings_is_empty = false;
+
+                cell_update(&pendings, |mut pendings| {
+                    // Try waiting on them.
+                    pendings.retain_mut(|(cmd, child, _token)| {
+                        match try_wait_on_child(cmd, &mut child.0, &mut stdout, &mut child.1) {
+                            Ok(Some(())) => {
+                                // Task done, remove the entry
+                                has_made_progress.set(true);
+                                false
+                            }
+                            Ok(None) => true, // Task still not finished, keep the entry
+                            Err(err) => {
+                                // Task fail, remove the entry.
+                                // Since we can only return one error, log the error to make
+                                // sure users always see all the compilation failures.
+                                has_made_progress.set(true);
+
+                                if self.cargo_output.warnings {
+                                    let _ = writeln!(stdout, "cargo:warning={}", err);
+                                }
+                                error = Some(err);
+
+                                false
+                            }
+                        }
+                    });
+                    pendings_is_empty = pendings.is_empty();
+                    pendings
+                });
+
+                if pendings_is_empty && is_disconnected.get() {
+                    break if let Some(err) = error {
+                        Err(err)
+                    } else {
+                        Ok(())
+                    };
+                }
+
+                YieldOnce::default().await;
+            }
+        };
+        let spawn_future = async {
+            for obj in objs {
+                let mut cmd = self.create_compile_object_cmd(obj)?;
+                let token = tokens.acquire().await?;
+                let mut child = spawn(&mut cmd, &self.cargo_output)?;
+                let mut stderr_forwarder = StderrForwarder::new(&mut child);
+                stderr_forwarder.set_non_blocking()?;
+
+                cell_update(&pendings, |mut pendings| {
+                    pendings.push((cmd, KillOnDrop(child, stderr_forwarder), token));
+                    pendings
+                });
+
+                has_made_progress.set(true);
+            }
+            is_disconnected.set(true);
+
+            Ok::<_, Error>(())
+        };
+
+        return block_on(wait_future, spawn_future, &has_made_progress);
+
+        struct KillOnDrop(Child, StderrForwarder);
+
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                let child = &mut self.0;
+
+                child.kill().ok();
+            }
+        }
+
+        fn cell_update<T, F>(cell: &Cell<T>, f: F)
+        where
+            T: Default,
+            F: FnOnce(T) -> T,
+        {
+            let old = cell.take();
+            let new = f(old);
+            cell.set(new);
+        }
+    }
+
+    #[cfg(not(feature = "parallel"))]
+    fn compile_objects(&self, objs: &[Object]) -> Result<(), Error> {
+        check_disabled()?;
+
+        for obj in objs {
+            let mut cmd = self.create_compile_object_cmd(obj)?;
+            run(&mut cmd, &self.cargo_output)?;
+        }
+
+        Ok(())
+    }
+>>>fortranc-rs/main
 
     fn assemble(&self, lib_name: &str, dst: &Path, objs: &[Object]) -> Result<(), Error> {
         // Delete the destination if it exists as we want to
@@ -3333,6 +4395,32 @@ impl Build {
         Ok(self.get_base_archiver_variant("RANLIB", "ranlib")?.0)
     }
 
+<<<HEAD
+===
+    fn which(&self, tool: &Path, path_entries: Option<&OsStr>) -> Option<PathBuf> {
+        fn check_exe(mut exe: PathBuf) -> Option<PathBuf> {
+            let exe_ext = std::env::consts::EXE_EXTENSION;
+            let check =
+                exe.exists() || (!exe_ext.is_empty() && exe.set_extension(exe_ext) && exe.exists());
+            check.then_some(exe)
+        }
+
+        // Loop through PATH entries searching for the |tool|.
+        let find_exe_in_path = |path_entries: &OsStr| -> Option<PathBuf> {
+            env::split_paths(path_entries).find_map(|path_entry| check_exe(path_entry.join(tool)))
+        };
+
+        // If |tool| is not just one "word," assume it's an actual path...
+        if tool.components().count() > 1 {
+            check_exe(PathBuf::from(tool))
+        } else {
+            path_entries
+                .and_then(find_exe_in_path)
+                .or_else(|| find_exe_in_path(&self.getenv("PATH")?))
+        }
+    }
+
+>>>fortranc-rs/main
     fn get_base_archiver_variant(
         &self,
         env: &str,
@@ -3367,7 +4455,7 @@ impl Build {
                     // And even extend it to gcc targets by searching for "ar" instead
                     // of "llvm-ar"...
                     let compiler = self.get_base_compiler().ok()?;
-                    if compiler.is_like_clang() {
+                    if compiler.is_like_clang() ||compiler.is_like_flang() {
                         name = format!("llvm-{tool}").into();
                         self.search_programs(&compiler.path, &name, &self.cargo_output)
                             .map(|name| self.cmd(name))
@@ -3399,6 +4487,7 @@ impl Build {
                     // of not running ranlib on Windows anyway, so it feels okay to return lib.exe
                     // here.
 
+<<<HEAD
                     let compiler = self.get_base_compiler()?;
                     let lib = if compiler.family == (ToolFamily::Msvc { clang_cl: true }) {
                         self.search_programs(
@@ -3420,6 +4509,7 @@ impl Build {
                         None
                     };
 
+                    // TODO: problem w/ fortran here?
                     if let Some(lib) = lib {
                         name = lib;
                         self.cmd(&name)
@@ -4240,6 +5330,7 @@ impl Build {
             return None;
         }
 
+<<<HEAD
         ::find_msvc_tools::find_tool_with_env(target.full_arch, tool, &BuildEnvGetter(self))
             .map(Tool::from_find_msvc_tools)
     }
@@ -4389,6 +5480,18 @@ fn is_arm(target: &TargetInfo<'_>) -> bool {
     matches!(target.arch, "aarch64" | "arm64ec" | "arm")
 }
 
+===
+        windows_registry::find_tool_inner(target.full_arch, tool, &BuildEnvGetter(self))*/
+        None
+    }
+}
+
+fn fail(s: &str) -> ! {
+    eprintln!("\n\nerror occurred in fortranc-rs: {}\n\n", s);
+    std::process::exit(1);
+}
+
+>>>fortranc-rs/main
 #[derive(Clone, Copy, PartialEq)]
 enum AsmFileExt {
     /// `.asm` files. On MSVC targets, we assume these should be passed to MASM

@@ -1,6 +1,15 @@
+<<<<<<< HEAD
 use std::{env, mem};
 
 use crate::{target::TargetInfo, utilities::OnceLock, Error, ErrorKind};
+=======
+use crate::{
+    target::{llvm, TargetInfo},
+    utilities::OnceLock,
+    Error, ErrorKind,
+};
+use std::{env, str::FromStr};
+>>>>>>> fortranc-rs/main
 
 #[derive(Debug)]
 struct TargetInfoParserInner {
@@ -85,6 +94,7 @@ impl TargetInfoParserInner {
             );
             env = mem::replace(&mut abi, String::default().into_boxed_str());
         }
+
 
         Ok(Self {
             full_arch: full_arch.to_string().into_boxed_str(),
@@ -417,7 +427,7 @@ impl<'a> TargetInfo<'a> {
             "wali" => "unknown",
             "lynx" => "unknown",
             // Some Linux distributions set their name as the target vendor,
-            // so we have to assume that it can be an arbitary string.
+            // so we have to assume that it can be an arbitrary string.
             vendor => vendor,
         };
 
