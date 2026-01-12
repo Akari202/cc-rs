@@ -224,7 +224,7 @@ impl Tool {
             // (#1082). The file stays on disk and its path remains valid until `tmp` is dropped.
             tmp_c_file.flush()?;
             tmp_c_file.sync_data()?;
-            drop(tmp_file);
+            drop(tmp_c_file);
             let mut tmp_f90 =
                 NamedTempfile::new(&out_dir, "detect_compiler_family.f90").map_err(|err| {
                     Error {
@@ -243,7 +243,7 @@ impl Tool {
             // (#1082). The file stays on disk and its path remains valid until `tmp` is dropped.
             tmp_f90_file.flush()?;
             tmp_f90_file.sync_data()?;
-            drop(tmp_file);
+            drop(tmp_f90_file);
 
             // When expanding the file, the compiler prints a lot of information to stderr
             // that it is not an error, but related to expanding itself.
@@ -253,7 +253,10 @@ impl Tool {
             compiler_detect_output.warnings = compiler_detect_output.debug;
 
             let mut cmd = Command::new(path);
-            cmd.arg("-E").arg(tmp.path());
+            cmd.arg("-E").arg(tmp_c.path());
+            // TODO
+            // let mut cmd = Command::new(path);
+            // cmd.arg("-E").arg(tmp_f90.path());
 
             // The -Wslash-u-filename warning is normally part of stdout.
             // But with clang-cl it can be part of stderr instead and exit with a
